@@ -458,3 +458,50 @@ test('every API response carries the API policy and nosniff on real dev and prev
     }
   }
 });
+
+test('the dev server refuses .env behind query-suffix variants, not just the bare path', async (t) => {
+  // The deny list above is only as good as Vite's enforcement of it: Vite
+  // 6.4.4 served `/.env?raw` (and @fs/?import variants) despite '.env' being
+  // listed (GHSA-8g5g-mxqh-grgj). .env holds every provider key, so check the
+  // behaviour on a real server rather than the config shape.
+  const root = await makeFixtureRoot('gev-fs-deny-');
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const canary = 'gev-fs-deny-canary-not-a-key';
+  await writeFile(
+    path.join(root, 'index.html'),
+    '<!doctype html><title>x</title>',
+  );
+  await writeFile(path.join(root, '.env'), `GEV_FS_DENY_CANARY=${canary}\n`);
+  // Positive control: the same query suffix serves a file that is not denied,
+  // so a passing run means .env was refused, not that nothing was served.
+  await writeFile(path.join(root, 'visible.txt'), 'gev-fs-deny-control');
+  const server = await createServer({
+    root,
+    configFile: false,
+    logLevel: 'silent',
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      fs: createBrowserViteConfig().server.fs,
+    },
+  });
+  t.after(() => server.close());
+  await server.listen();
+  const { port } = server.httpServer.address();
+  const fsRoot = root.replace(/\\/g, '/').replace(/^(?!\/)/, '/');
+  const control = await fetch(`http://127.0.0.1:${port}/visible.txt?raw`);
+  assert.match(await control.text(), /gev-fs-deny-control/);
+  for (const probe of [
+    '/.env',
+    '/.env?raw',
+    '/.env?raw??',
+    '/.env?import&raw??',
+    '/.env?url&raw',
+    '/.env?&raw',
+    `/@fs${fsRoot}/.env?raw??`,
+    `/@fs${fsRoot}/.env?import&?raw`,
+  ]) {
+    const body = await (await fetch(`http://127.0.0.1:${port}${probe}`)).text();
+    assert.ok(!body.includes(canary), `${probe} served .env contents`);
+  }
+});
